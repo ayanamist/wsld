@@ -2,6 +2,7 @@
 #![windows_subsystem = "windows"]
 
 mod config;
+mod logger;
 mod ssh_agent;
 mod tcp;
 mod time;
@@ -52,7 +53,7 @@ async fn task(vmid: Uuid) -> std::io::Result<()> {
         tokio::task::spawn(async move {
             let result = handle_stream(stream).await;
             if let Err(err) = result {
-                eprintln!("Error: {}", err);
+                lerror!("Error handling stream: {}", err);
             }
         });
     }
@@ -62,14 +63,28 @@ async fn task(vmid: Uuid) -> std::io::Result<()> {
 async fn main() {
     unsafe { winapi::um::wincon::AttachConsole(winapi::um::wincon::ATTACH_PARENT_PROCESS) };
 
+    logger::init();
+    linfo!("wsldhost starting (daemon={})", CONFIG.daemon);
+
     if CONFIG.daemon {
         let mut prev_vmid = None;
         let mut future: Option<tokio::task::JoinHandle<()>> = None;
         loop {
-            let vmid = tokio::task::spawn_blocking(|| vmcompute::get_wsl_vmid().unwrap())
-                .await
-                .unwrap();
+            let vmid = match tokio::task::spawn_blocking(vmcompute::get_wsl_vmid).await {
+                Ok(Ok(vmid)) => vmid,
+                Ok(Err(err)) => {
+                    lerror!("get_wsl_vmid failed: {}", err);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+                Err(err) => {
+                    lerror!("get_wsl_vmid task join failed: {}", err);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
             if vmid != prev_vmid {
+                linfo!("WSL vmid changed: {:?} -> {:?}", prev_vmid, vmid);
                 if let Some(future) = future.take() {
                     future.abort();
                 }
@@ -79,10 +94,11 @@ async fn main() {
                         // Three chances, to avoid a race between get_wsl_vmid and spawn.
                         for _ in 0..3 {
                             if let Err(err) = task(vmid).await {
-                                eprintln!("Failed to listen: {}", err);
+                                lerror!("Failed to listen on vmid {}: {}", vmid, err);
                             }
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         }
+                        lerror!("Giving up listening on vmid {} after 3 attempts", vmid);
                         std::process::exit(1);
                     }));
                 }
@@ -92,13 +108,21 @@ async fn main() {
     } else {
         let vmid = match CONFIG.vmid {
             Some(str) => str,
-            None => vmcompute::get_wsl_vmid()
-                .unwrap()
-                .expect("WSL is not running"),
+            None => match vmcompute::get_wsl_vmid() {
+                Ok(Some(vmid)) => vmid,
+                Ok(None) => {
+                    lerror!("WSL is not running");
+                    return;
+                }
+                Err(err) => {
+                    lerror!("get_wsl_vmid failed: {}", err);
+                    return;
+                }
+            },
         };
 
         if let Err(err) = task(vmid).await {
-            eprintln!("Failed to listen: {}", err);
+            lerror!("Failed to listen: {}", err);
             return;
         }
     }
